@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <sys/types.h>
@@ -1082,6 +1083,23 @@ int ios_fill_thread_context( struct thread *thread,
 #endif  /* WINE_IOS */
 
 /* read data from a process memory space */
+#ifdef WINE_IOS
+/* iDeck, 2026-10-22: a server request names the target process's guest
+ * addresses. The server thread's PEB is never the owner of those buffers. */
+static int ios_target_fixed_image( struct process *process, client_ptr_t ptr,
+                                   data_size_t size, client_ptr_t *real )
+{
+    extern int ios_fixed_image_translate( unsigned long long, unsigned long long,
+                                          void *, unsigned long long * );
+    unsigned long long backing;
+
+    if (process->unix_pid != getpid() || !process->peb ||
+        !ios_fixed_image_translate( ptr, size, (void *)(uintptr_t)process->peb, &backing )) return 0;
+    *real = backing;
+    return 1;
+}
+#endif
+
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
 {
     kern_return_t ret;
@@ -1091,8 +1109,8 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
     /* iOS pseudo-processes share this task, but do not send task ports through
      * launchd. The request handler already checked PROCESS_VM_READ on the
      * target handle. Use our task only for a target registered in this Unix
-     * process. Keep get_process_port() and write_process_memory() unchanged:
-     * enabling writes as well previously regressed other applications. */
+     * process. Writes are still denied by default; the isolated fixed-image
+     * path below permits only its exact owner's registered backing. */
     if (!process_port && process->unix_pid == getpid())
     {
         /* ml1003: escape hatch. get_process_port()'s own comment records that a
@@ -1125,6 +1143,9 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
         set_error( STATUS_ACCESS_DENIED );
         return 0;
     }
+#ifdef WINE_IOS
+    ios_target_fixed_image( process, ptr, size, &ptr );
+#endif
 
     ret = mach_vm_read_overwrite( process_port, (mach_vm_address_t)ptr, (mach_vm_size_t)size, (mach_vm_address_t)dest, &bytes_read );
     mach_set_error( ret );
@@ -1138,6 +1159,10 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
     kern_return_t ret;
     mach_port_t process_port = get_process_port( process );
     mach_vm_offset_t data;
+#ifdef WINE_IOS
+    int fixed_local = ios_target_fixed_image( process, ptr, size, &ptr );
+    if (fixed_local) process_port = mach_task_self();
+#endif
 
     if (written) *written = 0;
 
@@ -1160,6 +1185,11 @@ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t
     memcpy( (void *)data, src, size );
 
     ret = mach_vm_write( process_port, (mach_vm_address_t)ptr, data, (mach_msg_type_number_t)size );
+#ifdef WINE_IOS
+    /* Never suspend our own Mach task to repair protection: that suspends
+     * wineserver too. A protected backing fails with the kernel's error. */
+    if (fixed_local) goto out;
+#endif
 
     /*
      * On arm64 macOS, enabling execute permission for a memory region automatically disables write

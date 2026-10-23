@@ -5,4 +5,4 @@
 # build-ipa.yml's "Build number" step reads it, and the app's version is
 # 0.1.<number>. GitHub's run_number does not follow it.
 # iDeck-BCD, 2026-10-20: this fork's builds from BCD 0.1.574's source: 575 (first), 576 (wintypes), 577 (menu button over the desktop), 578 (faults inside system calls), 581 (BCD 0.1.580 merged; 64-bit Common-Controls identity; 579 and 580 are upstream's numbers), 582 (.msi entries; 64-bit msi.dll and msiexec.exe), 583 (activeds.dll).
-583
+592

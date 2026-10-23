@@ -462,7 +462,8 @@ armexpr = mimv[arm:mimv.index(';', arm)]
 for part in ('IMAGE_FILE_MACHINE_AMD64', 'IMAGE_NT_OPTIONAL_HDR64_MAGIC', '!image_info->is_hybrid', '!image_info->wine_builtin',
              '!ios_wow_base()', '!ios_map_resource_view'):
     check(part in armexpr, 'armed only for the [x64-image] images: ' + part)
-x64 = mimv[mimv.index('if (ios_x64_image_nocopy_enabled() && !ios_map_resource_view && !ios_wow_base() &&'):]
+x64 = mimv[mimv.index('if ((ios_x64_image_nocopy_enabled() || ios_fixed_image_candidate( image_info )) &&\n'
+                     '        !ios_map_resource_view && !ios_wow_base() &&'):]
 check('view->protect |= VPROT_X64DATA;' in x64[:800], 'the [x64-image] mark the flush re-checks is still set here')
 check('ios_swap_image_npend = 0;' in mimv[:loop], 'stale notes are dropped before the loop')
 

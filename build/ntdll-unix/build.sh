@@ -18,6 +18,8 @@ FAILED_FILES=""
 compile_one() {
     local src=$1
     local name=$2
+    local io_flags=()
+    if [ "$name" = "ios_fixed_image_io" ]; then io_flags=(-DIOS_FIXED_IMAGE_IO_IMPL=1); fi
     echo -n "  $name... "
 
     if xcrun -sdk iphoneos clang \
@@ -26,6 +28,7 @@ compile_one() {
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
+        -include "$BUILD_DIR/shims/ios_fixed_image_io.h" "${io_flags[@]}" \
         -I"$BUILD_DIR/shims" -I"$BUILD_DIR/../madsync" -DHAVE_LINUX_NTSYNC_H=1 \
         -I"$WINE_BUILD/dlls/ntdll" -I"$WINE_SRC/dlls/ntdll" -I"$WINE_SRC/dlls/ntdll/unix" \
         -I"$WINE_BUILD/include" -I"$WINE_SRC/include" \
@@ -66,6 +69,7 @@ compile_unixlib() {
         -Wno-implicit-function-declaration -Wno-int-conversion \
         -include "$WINE_BUILD/include/config.h" \
         -include "$BUILD_DIR/shims/wine_ios_exit.h" \
+        -include "$BUILD_DIR/shims/ios_fixed_image_io.h" \
         -I"$BUILD_DIR/shims" -I"$BUILD_DIR/../madsync" -DHAVE_LINUX_NTSYNC_H=1 \
         -I"$WINE_BUILD/include" -I"$WINE_SRC/include" \
         -D__WINESRC__ -D_NTSYSTEM_ -D_ACRTIMP= -DWINBASEAPI= \
@@ -89,6 +93,7 @@ echo "=== Building ntdll unix (iOS) ==="
 # IAudioClock that advances at real time so FMOD's audio-gated rhythm
 # logic in Thumper et al. advances past intro music.
 compile_one "$BUILD_DIR/audio_null_ios.c" "audio_null_ios"
+compile_one "$BUILD_DIR/ios_fixed_image_io.c" "ios_fixed_image_io"
 compile_one "$BUILD_DIR/../madsync/madsync.c" "madsync"   # ml1058: userspace ntsync
 
 # iOS-Madeira 2026-07-05 (Steam S0): network + crypto unix sides.
@@ -211,10 +216,15 @@ echo "Results: $SUCCEEDED succeeded, $FAILED failed"
 if [ -n "$FAILED_FILES" ]; then
     echo "Failed:$FAILED_FILES"
 fi
+if [ "$FAILED" -ne 0 ]; then
+    echo "Refusing to archive stale objects after a compile failure."
+    exit 1
+fi
 
 echo ""
 echo "=== Building libntdll_unix.a ==="
 ar rcs "$OBJ_DIR/libntdll_unix.a" \
+    "$OBJ_DIR/ios_fixed_image_io.o" \
     "$OBJ_DIR/audio_null_ios.o" "$OBJ_DIR/madsync.o" "$OBJ_DIR/nsi_unixlib_ios.o" \
     "$OBJ_DIR/nsi_network_ios.o" "$OBJ_DIR/nsi_ndis.o" "$OBJ_DIR/nsi_ip.o" \
     "$OBJ_DIR/gnutls_symtab_ios.o" "$OBJ_DIR/ws2_32_unixlib.o" \
@@ -230,5 +240,6 @@ ar rcs "$OBJ_DIR/libntdll_unix.a" \
 
 echo "Copying to app..."
 cp "$OBJ_DIR/libntdll_unix.a" "$APP_LIB"
+if [ "$FAILED" -eq 0 ]; then touch "$OBJ_DIR/fixed-image-io.stamp"; fi
 echo "libntdll_unix.a: $(wc -c < "$APP_LIB" | tr -d ' ') bytes"
 echo "Done!"

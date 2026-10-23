@@ -50,7 +50,7 @@ assert flag > 0x0800, 'above the per-mapping flags that exist'
 # --- the mark in map_image_into_view ------------------------------------------
 mapper = function(native, 'static NTSTATUS map_image_into_view(')
 mark = mapper.index('view->protect |= VPROT_X64DATA;')
-cond_start = mapper.rindex('if (ios_x64_image_nocopy_enabled()', 0, mark)
+cond_start = mapper.rindex('if ((ios_x64_image_nocopy_enabled()', 0, mark)
 cond = mapper[cond_start:mark]
 for need in ('!ios_map_resource_view', '!ios_wow_base()', 'nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64',
              'nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC', '!(view->protect & VPROT_ARM64EC)',

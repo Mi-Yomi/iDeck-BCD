@@ -85,20 +85,30 @@ code = r'''
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <pthread.h>
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000D)
+#define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)
 #define ERR(...) do { } while (0)
 static void *cur_peb;
+static int fixed_teardown;
 void *ios_jit_current_peb(void) { return cur_peb; }
 const char *ios_pe_module_name( const void *image_base, size_t image_size )
 { (void)image_base; (void)image_size; return "test.dll"; }
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real, unsigned long long *size,
                        void **owner )
-{ (void)idx; (void)low; (void)real; (void)size; (void)owner; return 0; }
+{
+    if (!fixed_teardown || idx > 1) return 0;
+    *low = 0x140000000ull; *real = 0x7100000000ull; *size = 0x10000;
+    *owner = idx ? cur_peb : (void *)0x1234;
+    return 1;
+}
 void ios_push_subfloor_window( unsigned long long a, unsigned long long b, unsigned long long c, void *owner )
 { (void)a; (void)b; (void)c; (void)owner; }
 static void ios_resolve_fex_exports( void ) { }
+/* This fixture models ordinary EC aliases and publishes no fixed-image windows. */
+static int ios_fex_fixed_window_abi( void *owner ) { (void)owner; return 0; }
 '''
 code += between(native, '#define IOS_JIT_MAX_MAPPINGS', '\n};')
 code += 'static struct ios_jit_mapping ios_jit_mappings[IOS_JIT_MAX_MAPPINGS];\n'
@@ -113,6 +123,24 @@ code += function(native, 'static int ios_jit_owned_copy( void *pe_base, void *pe
 code += function(native, 'static int ios_jit_alias_drain_wants( int i, void *own )')
 code += function(native, 'NTSTATUS unixcall_ios_push_jit_aliases(void *args)')
 code += 'static void reclaim_drop( void *peb )\n{\n' + drop.group(0) + '}\n'
+# Replay the production fixed-image retirement before the legacy handoff.
+retire = function(native, 'void ios_retire_own_fixed_base_image( void *dying_peb )')
+retire = ('void ios_retire_own_fixed_base_image(void *dying_peb)\n{\n    unsigned status;\n' +
+          retire[retire.index('    if (dying_peb'):retire.index('    /* Disables the legacy fixed-base generation handoff;')] + '}\n')
+assert retire.index('ios_alias_cb_drop( dying_peb )') < retire.index('NtUnmapViewOfSection(')
+code += r'''
+typedef uintptr_t ULONG_PTR;
+#define NtCurrentProcess() ((void *)-1)
+static unsigned fixed_unmaps;
+static unsigned NtUnmapViewOfSection(void *process, void *base)
+{
+    assert(process == NtCurrentProcess() && base == (void *)0x140000000ull);
+    assert(!ios_alias_cb_for(cur_peb)); /* No callback/probe into unloaded FEX. */
+    ++fixed_unmaps;
+    return 0;
+}
+'''
+code += retire
 code += r'''
 static const void *find_export_base; static const char *find_export_name;
 static void *ios_pe_find_export( const unsigned char *base, const char *want )
@@ -174,12 +202,55 @@ static void add_child_copy( uint64_t jit, size_t size, void *owner )
     ios_jit_mappings[s].pe_base = (void *)NT_PE;
 }
 
+static char race_owner_a, race_owner_b;
+static void race_callback_a( unsigned long long p, unsigned long long j, unsigned long long s )
+{
+    (void)j; (void)s;
+    assert( p == (uintptr_t)&race_owner_a );
+    assert( ios_alias_cb_for( &race_owner_a ) == race_callback_a );
+}
+static void race_callback_b( unsigned long long p, unsigned long long j, unsigned long long s )
+{
+    (void)j; (void)s;
+    assert( p == (uintptr_t)&race_owner_b );
+    assert( ios_alias_cb_for( &race_owner_b ) == race_callback_b );
+}
+struct callback_race { void *owner, *other; ios_alias_cb_t callback, other_callback; };
+static void *race_callbacks( void *opaque )
+{
+    struct callback_race *race = opaque;
+    for (unsigned i = 0; i < 20000; ++i)
+    {
+        ios_alias_cb_set( race->owner, race->callback );
+        ios_alias_cb_t own = ios_alias_cb_for( race->owner );
+        ios_alias_cb_t other = ios_alias_cb_for( race->other );
+        assert( own == race->callback && (!other || other == race->other_callback) );
+        own( (uintptr_t)race->owner, 0, 0 ); /* callback may reenter after the snapshot */
+        ios_alias_cb_drop( race->owner );
+        assert( !ios_alias_cb_for( race->owner ) );
+    }
+    return NULL;
+}
+static void callback_concurrency(void)
+{
+    struct callback_race races[] = {
+        { &race_owner_a, &race_owner_b, race_callback_a, race_callback_b },
+        { &race_owner_b, &race_owner_a, race_callback_b, race_callback_a }
+    };
+    pthread_t threads[2];
+    for (unsigned i = 0; i < 2; ++i) assert( !pthread_create( &threads[i], NULL, race_callbacks, &races[i] ) );
+    for (unsigned i = 0; i < 2; ++i) assert( !pthread_join( threads[i], NULL ) );
+    assert( !ios_alias_cb_for( &race_owner_a ) && !ios_alias_cb_for( &race_owner_b ) );
+    puts( "PASS: concurrent sibling callback registration, snapshot, drop and slot reuse preserve ownership" );
+}
+
 int main( int argc, char **argv )
 {
     const int own_on = argc > 1 && !strcmp( argv[1], "on" );
     const int pp = argc > 2 && !strcmp( argv[2], "pp" );   /* per-process pushes */
     struct ios_push_jit_aliases_args reg;
 
+    if (pp) callback_concurrency();
     /* Session boot: ntdll and two images, then the main emulator registers. */
     cur_peb = MAIN_PEB;
     ios_jit_add_mapping( (void *)NT_PE, (void *)NT_MAIN, NT_SIZE );
@@ -254,6 +325,14 @@ int main( int argc, char **argv )
     reclaim_drop( MAIN_PEB );                                   /* not the registrant: kept */
     assert( ios_jit_alias_pushback_cb == cb_child );
     if (pp) ios_alias_cb_set( MAIN_PEB, cb_main );              /* the main's own callback survives */
+    if (pp)
+    {
+        cur_peb = CHILD_PEB; fixed_teardown = 1;
+        ios_retire_own_fixed_base_image(CHILD_PEB);
+        assert(fixed_unmaps == 1 && !ios_alias_cb_for(CHILD_PEB));
+        assert(ios_alias_cb_for(MAIN_PEB) == cb_main);
+        fixed_teardown = 0;
+    }
     reclaim_drop( CHILD_PEB );
     assert( !ios_jit_alias_pushback_cb && !ios_jit_alias_pushback_peb );
     assert( !ios_alias_cb_for( CHILD_PEB ) );
@@ -319,7 +398,7 @@ with tempfile.TemporaryDirectory(prefix='madeira-child-ntdll-alias-') as directo
     executable = folder / 'check'
     cc = os.environ.get('CC', 'cc')
     flags = [cc, '-std=gnu11', '-Wall', '-Wextra', '-Wno-unused-function', '-Wno-unused-parameter',
-             '-Werror', '-g', str(source), '-o', str(executable)]
+             '-Werror', '-g', '-pthread', str(source), '-o', str(executable)]
     sanitize = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all']
     if subprocess.run(flags[:1] + sanitize + flags[1:], capture_output=True).returncode == 0:
         print('built with AddressSanitizer/UBSan')

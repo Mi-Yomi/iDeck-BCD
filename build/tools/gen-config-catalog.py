@@ -178,6 +178,15 @@ OVERLAY = {
                         "pool copy exists, so both use the copy, as on iOS 27. 0 restores the previous behaviour. "
                         "Logged as [wow-cpu-pool] and [exec-split]. Read once per session.",
                 "sources": ["build/ntdll-unix/virtual_ios.c"]},
+    # iDeck-BCD, 2026-10-22: separate fixed-image backing for concurrent x64 processes.
+    "env.MADEIRA_FIXED_IMAGE_ISOLATION": {"category": "Memory & JIT pool",
+                "title": "Separate fixed-base x64 program images", "kind": "bool", "default": "0",
+                "note": "Default off. 1: x64 images without relocations keep their fixed guest addresses while each "
+                        "process receives private backing memory and its own FEX translation window. Requires the "
+                        "matching emulator build and per-process aliases. Intended for parent and child programs "
+                        "that both require the same image base, such as the 1C launcher chain. Experimental; enable "
+                        "in the program's own settings and restart the session. Device validation is required.",
+                "sources": ["build/ntdll-unix/virtual_ios.c"]},
     "env.MADEIRA_FIXED_BASE_GUARD": {"category": "Memory & JIT pool", "title": "Keep 0x140000000 for a fixed-base game",
                 "kind": "bool", "default": "0",
                 "note": "Default off. 1: a resource-only image view (a version or resource query, e.g. the Rockstar "

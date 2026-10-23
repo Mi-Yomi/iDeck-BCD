@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -2622,7 +2623,9 @@ static void *ios_mach_exception_thread( void *arg )
              * or foreign mmap -- can be mapped there, and no other handler can
              * legitimately own it. An address outside every registered window
              * falls through untouched, so non-sub-floor faults keep their exact
-             * current ordering. */
+             * current ordering. iDeck, 2026-10-22: explicitly registered high
+             * fixed-image windows have an equally inaccessible guard, and
+             * require the faulting thread's exact PEB. */
             if (!handled && req->exception == EXC_BAD_ACCESS)
             {
                 /* ml1205: the faulting thread's own process decides the window */
@@ -8261,6 +8264,7 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
  * declared here because the Mach path must run the SAME emulator — see the
  * [unaligned-atomic] block below for why the two paths may not disagree. */
 static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, uintptr_t addr);
+static int ios_fixed_image_guarded( uintptr_t addr );
 /* madeira-bcd: the same for an ordered/exclusive/LSE access in the app's own
  * code, which FEX cannot handle (defined after ios_emulate_store_rel); the
  * executable's __TEXT bounds it checks, filled on first use. */
@@ -11948,6 +11952,7 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
 {
     int rt = insn & 0x1F;
 
+    if (ios_fixed_image_guarded( addr )) return 0;
     if ((insn >> 26) & 1) return 0;  /* SIMD/FP: not handled here */
 
     /* Load/store register — three no-writeback addressing forms, common
@@ -12111,35 +12116,78 @@ static int ios_emulate_unaligned_guest_access(ucontext_t *ctx, uint32_t insn, ui
  * the parent ran the child's bytes. A lookup now takes the PEB of the faulting
  * or calling thread; an owner of NULL (KUSER_SHARED_DATA) serves every process,
  * and a lookup without a known PEB falls back to any matching window (the old
- * behaviour). A process's windows are released when it exits
- * (ios_subfloor_release_owner). */
-#define IOS_SUBFLOOR_MAX 32
+ * behaviour, low windows only). A process's windows are released when it exits
+ * (ios_subfloor_release_owner). High fixed-image windows are registered only
+ * by the opt-in loader after reserving an inaccessible guest interval. */
+#define IOS_SUBFLOOR_MAX 128
 #define IOS_SUBFLOOR_FLOOR 0x100000000ull
 
 struct ios_subfloor_window
 {
-    uint64_t pref_base;   /* preferred base, below the floor: what the guest uses */
+    uint64_t pref_base;   /* guest address; high windows require an exact owner */
     uint64_t size;        /* SizeOfImage; 0 = free slot */
     uint64_t real_base;   /* where the loader actually mapped it */
     void    *owner_peb;   /* ml1205: the pseudo-process that mapped it, NULL = all */
+    unsigned generation; /* odd = published; even = changing or retired */
 };
 static struct ios_subfloor_window ios_subfloor[IOS_SUBFLOOR_MAX];
 static int ios_subfloor_count;
+static int ios_fixed_image_ever_registered;
 static pthread_mutex_t ios_subfloor_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long ios_subfloor_hits;
 static unsigned long long ios_subfloor_unknown;
 static unsigned long long ios_subfloor_refused;   /* ml956: backing inaccessible */
 
-void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
-                                  unsigned long long real_base, void *owner );
-void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
-                                  unsigned long long real_base, void *owner )
+/* iDeck, 2026-10-22: snapshots stay coherent when a retired slot is reused.
+ * Signal readers never take the writer mutex, which the interrupted thread
+ * may own. An in-progress update is a miss, never a foreign mapping. */
+static int ios_image_window_snapshot( int i, struct ios_subfloor_window *out )
+{
+    struct ios_subfloor_window *entry = &ios_subfloor[i];
+    unsigned before = __atomic_load_n( &entry->generation, __ATOMIC_ACQUIRE );
+
+    if (!(before & 1)) return 0;
+    out->pref_base = __atomic_load_n( &entry->pref_base, __ATOMIC_RELAXED );
+    out->real_base = __atomic_load_n( &entry->real_base, __ATOMIC_RELAXED );
+    out->size = __atomic_load_n( &entry->size, __ATOMIC_RELAXED );
+    out->owner_peb = __atomic_load_n( &entry->owner_peb, __ATOMIC_RELAXED );
+    __atomic_thread_fence( __ATOMIC_ACQUIRE );
+    return before == __atomic_load_n( &entry->generation, __ATOMIC_ACQUIRE ) && out->size;
+}
+
+static void ios_image_window_publish( int i, uint64_t guest, uint64_t real,
+                                     uint64_t size, void *owner )
+{
+    struct ios_subfloor_window *entry = &ios_subfloor[i];
+    unsigned changing = (__atomic_load_n( &entry->generation, __ATOMIC_RELAXED ) | 1u) + 1u;
+
+    __atomic_exchange_n( &entry->generation, changing, __ATOMIC_ACQ_REL );
+    __atomic_store_n( &entry->pref_base, guest, __ATOMIC_RELAXED );
+    __atomic_store_n( &entry->real_base, real, __ATOMIC_RELAXED );
+    __atomic_store_n( &entry->owner_peb, owner, __ATOMIC_RELAXED );
+    __atomic_store_n( &entry->size, size, __ATOMIC_RELAXED );
+    if (size) __atomic_store_n( &entry->generation, changing + 1u, __ATOMIC_RELEASE );
+}
+
+static int ios_register_image_window( unsigned long long pref_base, unsigned long long size,
+                                      unsigned long long real_base, void *owner, int fixed )
 {
     extern void ios_push_subfloor_window( unsigned long long, unsigned long long,
                                           unsigned long long, void * );
     int i, slot = -1;
 
-    if (!pref_base || !size || pref_base >= IOS_SUBFLOOR_FLOOR) return;
+    if (!pref_base || !size || !real_base || size > UINT64_MAX - pref_base ||
+        size > UINT64_MAX - real_base) return 0;
+    if (fixed)
+    {
+        /* The loader must already own a PROT_NONE guard over the whole guest
+         * interval. Its native backing must never overlap that interval. */
+        if (!owner || pref_base < IOS_SUBFLOOR_FLOOR || pref_base >= (1ull << 47) ||
+            real_base >= (1ull << 47) || size >= (1ull << 40) ||
+            size > (1ull << 47) - pref_base || size > (1ull << 47) - real_base ||
+            (pref_base < real_base + size && real_base < pref_base + size)) return 0;
+    }
+    else if (pref_base >= IOS_SUBFLOOR_FLOOR || size > IOS_SUBFLOOR_FLOOR - pref_base) return 0;
     pthread_mutex_lock( &ios_subfloor_lock );
     for (i = 0; i < ios_subfloor_count; i++)
     {
@@ -12150,21 +12198,29 @@ void ios_register_subfloor_image( unsigned long long pref_base, unsigned long lo
         }
         if (ios_subfloor[i].pref_base == pref_base && ios_subfloor[i].owner_peb == owner)
         {
+            if (fixed && (ios_subfloor[i].real_base != real_base || ios_subfloor[i].size != size))
+            {
+                pthread_mutex_unlock( &ios_subfloor_lock );
+                return 0; /* a live image cannot be silently replaced */
+            }
             /* Re-registration within one process (the ml1204 check keeps a
              * relocatable image from getting here over a stripped one). */
             if (ios_subfloor[i].real_base != real_base)
                 dprintf( 2, "[subfloor] ml938 window %#llx RE-POINTED %#llx -> %#llx "
                          "(owner %p)\n",
                          pref_base, (unsigned long long)ios_subfloor[i].real_base, real_base, owner );
-            ios_subfloor[i].size = 0;
-            __sync_synchronize();
-            ios_subfloor[i].real_base = real_base;
-            __sync_synchronize();
-            ios_subfloor[i].size = size;
+            ios_image_window_publish( i, pref_base, real_base, size, owner );
             pthread_mutex_unlock( &ios_subfloor_lock );
             /* ml951: FEX's copy must follow the re-point. */
             ios_push_subfloor_window( pref_base, real_base, size, owner );
-            return;
+            return 1;
+        }
+        if (fixed && ios_subfloor[i].owner_peb == owner &&
+            pref_base < ios_subfloor[i].pref_base + ios_subfloor[i].size &&
+            ios_subfloor[i].pref_base < pref_base + size)
+        {
+            pthread_mutex_unlock( &ios_subfloor_lock );
+            return 0;
         }
     }
     if (slot < 0)
@@ -12173,22 +12229,16 @@ void ios_register_subfloor_image( unsigned long long pref_base, unsigned long lo
         {
             pthread_mutex_unlock( &ios_subfloor_lock );
             dprintf( 2, "[subfloor] ml938 window table FULL, dropping %#llx\n", pref_base );
-            return;
+            return 0;
         }
         slot = ios_subfloor_count;
     }
     i = slot;
-    ios_subfloor[i].size      = 0;
-    __sync_synchronize();
-    ios_subfloor[i].pref_base = pref_base;
-    ios_subfloor[i].real_base = real_base;
-    ios_subfloor[i].owner_peb = owner;
-    __sync_synchronize();
-    ios_subfloor[i].size      = size;
+    if (fixed) __atomic_store_n( &ios_fixed_image_ever_registered, 1, __ATOMIC_RELEASE );
+    ios_image_window_publish( i, pref_base, real_base, size, owner );
     if (i == ios_subfloor_count)
     {
-        __sync_synchronize();
-        ios_subfloor_count = i + 1;
+        __atomic_store_n( &ios_subfloor_count, i + 1, __ATOMIC_RELEASE );
     }
     pthread_mutex_unlock( &ios_subfloor_lock );
     dprintf( 2, "[subfloor] ml938 window #%d: guest [%#llx,%#llx) -> real %#llx (%llu KB) owner %p\n",
@@ -12196,6 +12246,59 @@ void ios_register_subfloor_image( unsigned long long pref_base, unsigned long lo
     /* ml951: FEX needs this too, so its executable-range query can answer for
      * the low window instead of refusing the entry block. */
     ios_push_subfloor_window( pref_base, real_base, size, owner );
+    return 1;
+}
+
+void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
+                                  unsigned long long real_base, void *owner );
+void ios_register_subfloor_image( unsigned long long pref_base, unsigned long long size,
+                                  unsigned long long real_base, void *owner )
+{
+    ios_register_image_window( pref_base, size, real_base, owner, 0 );
+}
+
+int ios_register_fixed_image_window( unsigned long long guest, unsigned long long size,
+                                     unsigned long long real, void *owner );
+int ios_register_fixed_image_window( unsigned long long guest, unsigned long long size,
+                                     unsigned long long real, void *owner )
+{
+    return ios_register_image_window( guest, size, real, owner, 1 );
+}
+
+/* Roll back only the mapping the caller created, without retiring its other
+ * images. A stale cleanup cannot remove a replacement's translation. */
+int ios_unregister_fixed_image_window( unsigned long long guest, unsigned long long real, void *owner );
+int ios_unregister_fixed_image_window( unsigned long long guest, unsigned long long real, void *owner )
+{
+    extern void ios_push_subfloor_window( unsigned long long, unsigned long long, unsigned long long, void * );
+    int i, found = 0;
+
+    if (!owner || guest < IOS_SUBFLOOR_FLOOR) return 0;
+    pthread_mutex_lock( &ios_subfloor_lock );
+    for (i = 0; i < ios_subfloor_count; i++)
+    {
+        if (!ios_subfloor[i].size || ios_subfloor[i].pref_base != guest ||
+            ios_subfloor[i].real_base != real || ios_subfloor[i].owner_peb != owner) continue;
+        ios_image_window_publish( i, guest, real, 0, owner );
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock( &ios_subfloor_lock );
+    if (found) ios_push_subfloor_window( guest, real, 0, owner );
+    return found;
+}
+
+void ios_fixed_image_release( unsigned long long real, void *owner );
+void ios_fixed_image_release( unsigned long long real, void *owner )
+{
+    struct ios_subfloor_window entry;
+    int i, n = __atomic_load_n( &ios_subfloor_count, __ATOMIC_ACQUIRE );
+
+    if (!owner || !real) return;
+    for (i = 0; i < n; i++)
+        if (ios_image_window_snapshot( i, &entry ) && entry.pref_base >= IOS_SUBFLOOR_FLOOR &&
+            entry.real_base == real && entry.owner_peb == owner)
+            ios_unregister_fixed_image_window( entry.pref_base, real, owner );
 }
 
 /* ml1205: the pseudo-process is gone; free its windows. */
@@ -12212,8 +12315,7 @@ void ios_subfloor_release_owner( void *owner )
         dprintf( 2, "[subfloor] ml1205 window #%d %#llx -> %#llx released with its process %p\n",
                  i, (unsigned long long)ios_subfloor[i].pref_base,
                  (unsigned long long)ios_subfloor[i].real_base, owner );
-        ios_subfloor[i].size = 0;
-        __sync_synchronize();
+        ios_image_window_publish( i, ios_subfloor[i].pref_base, ios_subfloor[i].real_base, 0, owner );
     }
     pthread_mutex_unlock( &ios_subfloor_lock );
 }
@@ -12226,41 +12328,82 @@ int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *rea
 int ios_subfloor_enum( int idx, unsigned long long *low, unsigned long long *real,
                        unsigned long long *size, void **owner )
 {
-    uint64_t sz;
+    struct ios_subfloor_window entry = {0};
 
-    if (idx < 0 || idx >= ios_subfloor_count) return 0;
-    sz = ios_subfloor[idx].size;       /* 0 = free slot; read first, see register */
-    __sync_synchronize();
-    if (low)   *low   = ios_subfloor[idx].pref_base;
-    if (real)  *real  = ios_subfloor[idx].real_base;
-    if (owner) *owner = ios_subfloor[idx].owner_peb;
-    if (size)  *size  = sz;
+    if (idx < 0 || idx >= __atomic_load_n( &ios_subfloor_count, __ATOMIC_ACQUIRE )) return 0;
+    if (!ios_image_window_snapshot( idx, &entry )) entry.size = 0;
+    if (low)   *low   = entry.pref_base;
+    if (real)  *real  = entry.real_base;
+    if (owner) *owner = entry.owner_peb;
+    if (size)  *size  = entry.size;
     return 1;
 }
 
-/* ml1205: the window `peb` sees at addr. Exact owner or a shared (NULL-owner)
- * window wins; with no known peb, the last matching window answers. */
-static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
+/* ml1205: the window `peb` sees at addr. Legacy low windows can be shared or
+ * queried without a PEB; high fixed-image windows always require their owner.
+ * Subtraction-based whole-span checks also reject boundary crossings. */
+static uintptr_t ios_image_window_translate( uint64_t addr, uint64_t len, void *peb )
 {
-    int i, n = ios_subfloor_count;
+    int i, n = __atomic_load_n( &ios_subfloor_count, __ATOMIC_ACQUIRE );
     uintptr_t any = 0;
 
-    if (addr >= IOS_SUBFLOOR_FLOOR) return 0;   /* fast reject: the common case */
+    if (!len) len = 1;
+    if (len > UINT64_MAX - addr) return 0;
+    if (addr >= IOS_SUBFLOOR_FLOOR &&
+        (!peb || !__atomic_load_n( &ios_fixed_image_ever_registered, __ATOMIC_ACQUIRE ))) return 0;
     for (i = 0; i < n; i++)
     {
-        uint64_t sz = ios_subfloor[i].size, lo, re;
-        void *own;
+        struct ios_subfloor_window entry;
+        uint64_t offset;
 
-        if (!sz) continue;
-        __sync_synchronize();
-        lo = ios_subfloor[i].pref_base;
-        re = ios_subfloor[i].real_base;
-        own = ios_subfloor[i].owner_peb;
-        if (addr < lo || addr >= lo + sz) continue;
-        if (!own || own == peb) return (uintptr_t)(re + (addr - lo));
-        if (!peb) any = (uintptr_t)(re + (addr - lo));
+        if (!ios_image_window_snapshot( i, &entry ) || addr < entry.pref_base) continue;
+        offset = addr - entry.pref_base;
+        if (offset >= entry.size || len > entry.size - offset) continue;
+        if (entry.owner_peb == peb || (!entry.owner_peb && addr < IOS_SUBFLOOR_FLOOR))
+            return (uintptr_t)(entry.real_base + offset);
+        if (!peb && addr < IOS_SUBFLOOR_FLOOR) any = (uintptr_t)(entry.real_base + offset);
     }
     return any;
+}
+
+static uintptr_t ios_subfloor_translate( uint64_t addr, void *peb )
+{
+    return ios_image_window_translate( addr, 1, peb );
+}
+
+int ios_fixed_image_translate( unsigned long long guest, unsigned long long len, void *owner,
+                               unsigned long long *real_out );
+int ios_fixed_image_translate( unsigned long long guest, unsigned long long len, void *owner,
+                               unsigned long long *real_out )
+{
+    uintptr_t real;
+
+    if (!owner || guest < IOS_SUBFLOOR_FLOOR) return 0;
+    real = ios_image_window_translate( guest, len, owner );
+    if (!real) return 0;
+    if (real_out) *real_out = real;
+    return 1;
+}
+
+int ios_fixed_image_io_active(void);
+int ios_fixed_image_io_active(void)
+{
+    return __atomic_load_n( &ios_fixed_image_ever_registered, __ATOMIC_ACQUIRE );
+}
+
+/* These guards are inaccessible in every process. Legacy unaligned emulators
+ * must not dereference them after the owner-aware service declined an access. */
+static int ios_fixed_image_guarded( uintptr_t addr )
+{
+    struct ios_subfloor_window entry;
+    int i, n;
+
+    if (addr < IOS_SUBFLOOR_FLOOR || !ios_fixed_image_io_active()) return 0;
+    n = __atomic_load_n( &ios_subfloor_count, __ATOMIC_ACQUIRE );
+    for (i = 0; i < n; i++)
+        if (ios_image_window_snapshot( i, &entry ) && entry.pref_base >= IOS_SUBFLOOR_FLOOR &&
+            addr >= entry.pref_base && addr - entry.pref_base < entry.size) return 1;
+    return 0;
 }
 
 /* Read `size` bytes at `a` with the opc-implied extension. memcpy, not a cast
@@ -12532,6 +12675,96 @@ static int ios_emulate_store_rel( ucontext_t *ctx, uint32_t insn, uintptr_t addr
     return 0;
 }
 
+/* iDeck, 2026-10-22: high image windows share their backing with FEX atomics.
+ * A trapped native RMW must use the same hardware atomic operation. Exclusive
+ * monitors cannot survive the trap, so decline them instead of losing updates.
+ * Returns 1 when handled, 0 for another emulator, -1 for an unsafe operation. */
+static int ios_emulate_fixed_ordered( ucontext_t *ctx, uint32_t insn, uintptr_t addr )
+{
+    const unsigned size = (insn >> 30) & 3, bytes = 1u << size;
+    const unsigned rt = insn & 31, rs = (insn >> 16) & 31;
+    const unsigned opc = (insn >> 22) & 3;
+    unsigned operation = 0, extend = 1, alignment = bytes;
+    uint64_t value = 0, source = 0;
+
+    if ((insn & 0x3FFFFC00) == 0x085FFC00 ||     /* LDAXR */
+        (insn & 0x3FFFFC00) == 0x085F7C00 ||     /* LDXR */
+        (insn & 0x3FE0FC00) == 0x0800FC00 ||     /* STLXR */
+        (insn & 0x3FE0FC00) == 0x08007C00)       /* STXR */
+        return -1;
+
+    if ((insn & 0xBFA07C00) == 0x08207C00)      /* CASP */
+    {
+        alignment = (insn & 0x40000000) ? 16 : 8;
+        if ((rs | rt) & 1) return -1;
+    }
+    else if ((insn & 0xBFA07C00) == 0x88A07C00 ||
+             (insn & 0xBFA07C00) == 0x08A07C00) /* CAS, including byte/halfword */
+        alignment = bytes;
+    else if ((insn & 0x3FFFFC00) == 0x08DFFC00 ||
+             (insn & 0x3FFFFC00) == 0x38BFC000) /* LDAR / LDAPR */
+        operation = 1;
+    else if ((insn & 0x3F200C00) == 0x19000000 && opc)
+    {
+        if ((size == 3 && opc >= 2) || (size == 2 && opc == 3)) return -1;
+        operation = 1;                         /* LDAPUR, signed variants */
+        extend = opc;
+    }
+    else if ((insn & 0x3FFFFC00) == 0x089FFC00 ||
+             (insn & 0x3FFFFC00) == 0x089F7C00 ||
+             (insn & 0x3FE00C00) == 0x19000000)
+    {
+        operation = 2;                         /* STLR / STLLR / STLUR */
+        source = ios_get_reg( ctx, rt );
+    }
+    else
+    {
+        switch (insn & 0x3F20FC00)
+        {
+        case 0x38200000: operation = 3; break;  /* LDADD */
+        case 0x38201000: operation = 4; break;  /* LDCLR */
+        case 0x38202000: operation = 5; break;  /* LDEOR */
+        case 0x38203000: operation = 6; break;  /* LDSET */
+        case 0x38208000: operation = 7; break;  /* SWP */
+        default: return 0;
+        }
+        source = ios_get_reg( ctx, rs );
+    }
+    if (addr & (alignment - 1)) return -1;
+    if (!operation) return 0;                  /* aligned CAS uses existing hardware helper */
+
+#define IOS_FIXED_ATOMIC(T) do { \
+    T *ptr = (T *)addr; \
+    switch (operation) { \
+    case 1: value = __atomic_load_n( ptr, __ATOMIC_SEQ_CST ); break; \
+    case 2: __atomic_store_n( ptr, (T)source, __ATOMIC_SEQ_CST ); break; \
+    case 3: value = __atomic_fetch_add( ptr, (T)source, __ATOMIC_SEQ_CST ); break; \
+    case 4: value = __atomic_fetch_and( ptr, (T)~source, __ATOMIC_SEQ_CST ); break; \
+    case 5: value = __atomic_fetch_xor( ptr, (T)source, __ATOMIC_SEQ_CST ); break; \
+    case 6: value = __atomic_fetch_or( ptr, (T)source, __ATOMIC_SEQ_CST ); break; \
+    case 7: value = __atomic_exchange_n( ptr, (T)source, __ATOMIC_SEQ_CST ); break; \
+    } \
+} while (0)
+    switch (bytes)
+    {
+    case 1: IOS_FIXED_ATOMIC(uint8_t); break;
+    case 2: IOS_FIXED_ATOMIC(uint16_t); break;
+    case 4: IOS_FIXED_ATOMIC(uint32_t); break;
+    case 8: IOS_FIXED_ATOMIC(uint64_t); break;
+    }
+#undef IOS_FIXED_ATOMIC
+    if (operation == 2) return 1;
+    if (extend >= 2)
+    {
+        if (size == 0) value = (int64_t)(int8_t)value;
+        else if (size == 1) value = (int64_t)(int16_t)value;
+        else if (size == 2) value = (int64_t)(int32_t)value;
+        if (extend == 3) value = (uint32_t)value;
+    }
+    ios_ld_setreg( ctx, rt, value );
+    return 1;
+}
+
 /***********************************************************************
  *		ios_native_unaligned_emulate                    (madeira-bcd)
  *
@@ -12599,7 +12832,7 @@ static int ios_native_unaligned_emulate( ucontext_t *ctx, uint32_t insn, uintptr
 {
     int done;
 
-    if (!insn || !ios_pc_in_app_text( pc )) return 0;
+    if (!insn || ios_fixed_image_guarded( addr ) || !ios_pc_in_app_text( pc )) return 0;
     if ((insn & 0x3E000000) == 0x2C000000) return 0;   /* SIMD pairs: writeback forms, not ours */
     __atomic_thread_fence( __ATOMIC_SEQ_CST );
     done = ios_emulate_store_rel( ctx, insn, addr ) || ios_emulate_load_acq( ctx, insn, addr );
@@ -12757,11 +12990,16 @@ static int ios_subfloor_classify( uint32_t insn, unsigned *bytes, int *is_write 
         *is_write = 1;
         return 1;
     }
-    if ((insn & 0xBFA07C00) == 0x88A07C00 ||                        /* CAS*     */
-        (insn & 0xBFA07C00) == 0x08207C00)
+    if ((insn & 0xBFA07C00) == 0x88A07C00)                          /* CAS*     */
     {
         *bytes    = ((insn >> 30) & 1) ? 8u : 4u;
         *is_write = 1;                                              /* RMW      */
+        return 1;
+    }
+    if ((insn & 0xBFA07C00) == 0x08207C00)                          /* CASP*    */
+    {
+        *bytes    = ((insn >> 30) & 1) ? 16u : 8u;
+        *is_write = 1;
         return 1;
     }
     if ((insn & 0xBFA07C00) == 0x08A07C00)                          /* CASB/CASH (ml1208) */
@@ -12836,6 +13074,49 @@ static int ios_subfloor_backing_probe( uintptr_t real, unsigned bytes, int need_
     return 1;
 }
 
+#include "ios_fixed_exclusive.h"
+
+static int ios_service_fixed_exclusive( ucontext_t *ctx, uintptr_t guest, uintptr_t backing )
+{
+    struct ios_fixed_exclusive plan;
+    uint32_t code[4], flags = PSTATE_sig(ctx), target;
+    uint64_t regs[31];
+    uintptr_t pc = (uintptr_t)PC_sig(ctx), branch;
+    mach_vm_size_t got;
+    unsigned i;
+    int64_t advance;
+
+    for (i = 0; i < 4; ++i)
+    {
+        got = 0;
+        if (pc > UINTPTR_MAX - i * 4 ||
+            mach_vm_read_overwrite( mach_task_self(), pc + i * 4, 4,
+                                    (mach_vm_address_t)&code[i], &got ) != KERN_SUCCESS || got != 4)
+            return 0;
+    }
+    if (!ios_fixed_exclusive_decode( code, &plan ) ||
+        (backing & ((1u << plan.size) - 1))) return 0;
+    for (i = 0; i < 29; ++i) regs[i] = REGn_sig(i, ctx);
+    regs[29] = FP_sig(ctx); regs[30] = LR_sig(ctx);
+    if (regs[plan.base] != guest) return 0;
+    if (plan.mismatch)
+    {
+        if (plan.mismatch < 0 ? pc < (uint64_t)-plan.mismatch :
+                               pc > UINTPTR_MAX - (uint64_t)plan.mismatch) return 0;
+        branch = pc + plan.mismatch;
+        got = 0;
+        if (mach_vm_read_overwrite( mach_task_self(), branch, 4,
+                                    (mach_vm_address_t)&target, &got ) != KERN_SUCCESS || got != 4 ||
+            (target & 0xfffff0ff) != 0xd503305f) return 0; /* CLREX */
+    }
+    advance = ios_fixed_exclusive_run( &plan, backing, regs, &flags );
+    for (i = 0; i < 29; ++i) REGn_sig(i, ctx) = regs[i];
+    FP_sig(ctx) = regs[29]; LR_sig(ctx) = regs[30];
+    PSTATE_sig(ctx) = flags;
+    PC_sig(ctx) = pc + advance - 4; /* Both service callers advance by four. */
+    return 1;
+}
+
 static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *via, void *peb )
 {
     uint64_t addr = (uint64_t)(uintptr_t)fault_addr;
@@ -12884,6 +13165,12 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
      * guess -- use a conservative 8-byte span for bounds checks in that case
      * and keep the accessibility probe gated on the result, as before. */
     span = cls ? bytes : 8u;
+
+    /* iDeck, 2026-10-22: the initial lookup admits the fault, but only a
+     * whole-span lookup permits the access. High windows fail closed for an
+     * unknown encoding; guessing its width could touch a neighbouring image. */
+    if (real && ((addr >= IOS_SUBFLOOR_FLOOR && !cls) ||
+                 !(real = ios_image_window_translate( addr, span, peb )))) return 0;
 
     /* ml966: a low guest ALLOCATION resolves through its own registry, not the
      * ml938 image-window table. Checked here rather than in
@@ -12935,6 +13222,11 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         }
     }
 
+    /* Native LL/SC is serviced as a complete RMW, even though the trap is on
+     * its load. Prove write permission before the helper can issue its CAS. */
+    int fixed_exclusive = addr >= IOS_SUBFLOOR_FLOOR &&
+        ((insn & 0x3ffffc00) == 0x085ffc00 || (insn & 0x3ffffc00) == 0x085f7c00);
+    if (fixed_exclusive) is_write = 1;
     if (cls &&
         !ios_subfloor_backing_probe( real, bytes, is_write, &rb, &rs, &cur, &mx, &kr ))
     {
@@ -12971,6 +13263,15 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
         return 0;
     }
 
+    if (fixed_exclusive)
+    {
+        static unsigned serviced;
+        if (!ios_service_fixed_exclusive( ctx, addr, real )) return 0;
+        if (__atomic_fetch_add( &serviced, 1, __ATOMIC_RELAXED ) < 8)
+            dprintf( 2, "[fixed-image] native LL/SC serviced via=%s insn=%08x\n", via, insn );
+        return 1;
+    }
+
     /* ml1000: the emulator chain tries LOAD first and never consults is_write,
      * which ios_subfloor_classify has already decided from the encoding. If the
      * emulator that claims the instruction disagrees with that decision, the
@@ -12991,8 +13292,10 @@ static int ios_subfloor_service( ucontext_t *ctx, void *fault_addr, const char *
     {
         char claimed = 0;
 
-        ok = ios_emulate_load( ctx, insn, real );
-        if (ok) claimed = 'L';
+        ok = addr >= IOS_SUBFLOOR_FLOOR ? ios_emulate_fixed_ordered( ctx, insn, real ) : 0;
+        if (ok < 0) return 0;
+        if (ok) claimed = is_write ? 'R' : 'L';
+        if (!ok) { ok = ios_emulate_load( ctx, insn, real ); if (ok) claimed = 'L'; }
         if (!ok) { ok = ios_emulate_store_rel( ctx, insn, real ); if (ok) claimed = 'R'; }
         if (!ok) { ok = ios_emulate_store( ctx, insn, real );     if (ok) claimed = 'S'; }
 

@@ -18,6 +18,8 @@
 # lacks (sxs, mspatcha, odbccp32) and msiexec.exe (see MSX below), for an x86-64 .msi (owner's request:
 # 1C:Enterprise's official x86-64 package). The set had only the i386 msiexec.exe. And activeds.dll: that
 # package's custom-action DLL imports it (c0000135 at every call, build 582; its language list stayed empty).
+# iDeck-BCD, 2026-10-23: 1C's frame.dll requires oledlg.dll (build 590 device log), and its backbas.dll
+# requires odbc32.dll (build 591 device log; Wine's odbc32 loads without its unix side, Windows drivers only).
 # A DLL upstream already ships is never replaced. Run from the repository
 # root; needs llvm-mingw on PATH (or MINGW) and the native wine tools.
 #   usage: build-wine-extra-dlls.sh [native tools dir]
@@ -37,7 +39,7 @@ WANT="msvcr70 msvcr71 msvcr80 msvcr90 msvcr100 msvcr110 msvcrt20 msvcrt40 msvcir
       wbemprox wbemdisp wmiutils
       riched20 riched32 msftedit gdiplus mlang usp10 cabinet sspicli msxml3 msxml6
       msasn1 wldp hnetcfg msctf xmllite netprofm d2d1 wmvcore winegstreamer srvcli winedmo
-      msi sxs mspatcha odbccp32 activeds
+      msi sxs mspatcha odbccp32 activeds oledlg odbc32
       xaudio2_0 xaudio2_1 xaudio2_2 xaudio2_3 xaudio2_4 xaudio2_5 xaudio2_6 xaudio2_7 xaudio2_8 xaudio2_9
       x3daudio1_0 x3daudio1_1 x3daudio1_2 x3daudio1_3 x3daudio1_4 x3daudio1_5 x3daudio1_6 x3daudio1_7
       xapofx1_1 xapofx1_2 xapofx1_3 xapofx1_4 xapofx1_5
