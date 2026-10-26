@@ -69,6 +69,35 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           clang --version
 
+      - name: Check isolated fixed-image memory and FEX windows
+        run: |
+          set +e
+          python3 tests/host/check-fixed-image-isolation.py
+          native_status=$?
+          python3 tests/host/check-fex-guest-windows.py
+          fex_status=$?
+          python3 tests/host/check-child-ntdll-alias.py
+          alias_status=$?
+          test "$native_status:$fex_status:$alias_status" = 0:0:0
+
+      - name: Check required Wine DLL packaging gate
+        run: python3 tests/host/check-wine-media-dlls.py
+
+      - name: Check JIT pool image placement contracts
+        run: |
+          result=0
+          python3 tests/host/check-pool-low-images.py || result=1
+          python3 tests/host/check-x64-image-nocopy.py || result=1
+          python3 tests/host/check-swap-images.py || result=1
+          python3 tests/host/check-ec-hook.py || result=1
+          python3 tests/host/check-x64-graphics-entry.py || result=1
+          python3 tests/host/check-pool-startup-budget.py --require-swift || result=1
+          python3 tests/host/check-pool-placement.py || result=1
+          python3 tests/host/check-pool-split.py || result=1
+          python3 tests/host/check-pool-low.py || result=1
+          python3 tests/host/check-pool-code-exit.py || result=1
+          exit "$result"
+
       - name: Check generated settings catalog
         run: python3 tests/host/check-config-catalog.py
 
@@ -722,19 +751,6 @@ jobs:
           python3 tests/host/check-launch-routing.py
           python3 tests/host/check-cmd-bundle.py
 
-      - name: Check JIT pool image placement contracts
-        run: |
-          python3 tests/host/check-pool-low-images.py
-          python3 tests/host/check-x64-image-nocopy.py
-          python3 tests/host/check-swap-images.py
-          python3 tests/host/check-ec-hook.py
-          python3 tests/host/check-x64-graphics-entry.py
-          python3 tests/host/check-pool-startup-budget.py --require-swift
-          python3 tests/host/check-pool-placement.py
-          python3 tests/host/check-pool-split.py
-          python3 tests/host/check-pool-low.py
-          python3 tests/host/check-pool-code-exit.py
-
       # ajan2-tani: failure-path-only guest diagnostics ([entry-fail] for FEX's hlt / NoExec thunks,
       # [badrip] for a non-canonical guest RIP, [wow-initblock] when an i386 boot replaces another
       # ntdll base): Age of Empires IV, Garry's Mod, Vampire Survivors, art of rally. Log only; the
@@ -837,10 +853,7 @@ jobs:
           python3 tests/host/check-rtcs-cap.py
 
       - name: Build ntdll-unix
-        # Keep going so one run reports every broken stage (and caches FEX and
-        # LLVM). "Verify all linked archives exist" still fails the job before
-        # anything is archived if this produced no library.
-        continue-on-error: true
+        # Fixed-image support must not silently ship an older tracked archive.
         run: bash build/ntdll-unix/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/ntdll.log"; exit ${PIPESTATUS[0]}
 
       # The link failure showed up only at xcodebuild time; catch it here.
@@ -1013,10 +1026,7 @@ jobs:
           done
 
       - name: Build wineserver
-        # Keep going so one run reports every broken stage (and caches FEX and
-        # LLVM). "Verify all linked archives exist" still fails the job before
-        # anything is archived if this produced no library.
-        continue-on-error: true
+        # Target-owner memory translation must be present in this build.
         run: bash build/wineserver/build.sh 2>&1 | tee "$GITHUB_WORKSPACE/wineserver.log"; exit ${PIPESTATUS[0]}
 
       - name: Build win32u-unix
@@ -1281,19 +1291,24 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: FEX/build-arm64ec
-          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-${{ hashFiles('tools/patch-fex-ios-guest-windows.py', 'tools/build-xtajit64.sh') }}-v3
 
       - name: Build xtajit64.dll (FEX fixes, AVX opt-in)
         if: env.MINGW_OK == '1'
-        continue-on-error: true
         run: bash tools/build-xtajit64.sh
+
+      - name: Verify fixed-image FEX ABI and build process regression
+        run: |
+          toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/llvm-readobj --coff-exports app/Madeira/arm64ec-windows/xtajit64.dll > fixed-image-fex-exports.log
+          grep -q 'Name: IosGuestWindowAbi' fixed-image-fex-exports.log
+          bash tests/proc/build-fixed-image.sh build-out/fixed-image-test
 
       - name: Save FEX ARM64EC build
         if: steps.fexeccache.outputs.cache-hit != 'true' && hashFiles('FEX/build-arm64ec/Bin/libarm64ecfex.dll') != ''
         uses: actions/cache/save@v4
         with:
           path: FEX/build-arm64ec
-          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-v2
+          key: fex-arm64ec-${{ steps.fexrev.outputs.sha }}-${{ hashFiles('tools/patch-fex-ios-guest-windows.py', 'tools/build-xtajit64.sh') }}-v3
 
       # madeira-bcd: FEX's aarch64 WOW64 module (xtajit.dll, the 32-bit CPU
       # backend) was only ever built by hand (build/fex-wow64/build.sh). Built
@@ -2527,7 +2542,7 @@ jobs:
       # Launcher error117 in406: WMVCORE.DLL was never packaged. Its genuine
       # Wine reader imports winegstreamer; both must build despite the optional
       # handling of unrelated extra DLLs above. Do not ship another missing farm.
-      - name: Verify Wine media reader DLLs
+      - name: Verify Wine media and 1C DLLs
         run: python3 tools/check-wine-media-dlls.py app/Madeira/arm64ec-windows
 
       - name: Save wine arm64ec build
@@ -3007,6 +3022,15 @@ jobs:
         with:
           name: unsigned-ipa-${{ steps.bn.outputs.n }}
           path: build-out/*-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixed-image-test-${{ steps.bn.outputs.n }}
+          path: |
+            build-out/fixed-image-test/*.exe
+            tests/proc/FIXED-IMAGE.md
           if-no-files-found: error
           retention-days: 14
 

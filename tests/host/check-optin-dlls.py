@@ -37,10 +37,11 @@ want = build[build.index('WANT="'):]
 want = want[:want.index('"\n', 6)]
 optin = re.search(r'OPTIN_WANT="([^"]*)"', build)
 names = optin.group(1).split() if optin else []
-# iDeck-BCD, 2026-10-26: these also ship under their own names (WANT) for 1C's 64-bit .msi install through msiexec.exe;
+# iDeck-BCD, 2026-10-26: these also ship under their own names (WANT) for 1C's 64-bit .msi install through msiexec.exe
+# (and oledlg for 1C's frame.dll, build 591);
 # a listed game's link to the -optin copy only ever replaces a link of ours, never the plain DLL.
-PLAIN = {'msi', 'sxs', 'mspatcha', 'odbccp32'}
-check('iDeck-BCD: msi, sxs, mspatcha and odbccp32 ship under their own names too', all(re.search(r'\b%s\b' % n, want) for n in PLAIN))
+PLAIN = {'msi', 'sxs', 'mspatcha', 'odbccp32', 'oledlg'}
+check('iDeck-BCD: msi, sxs, mspatcha, odbccp32 and oledlg ship under their own names too', all(re.search(r'\b%s\b' % n, want) for n in PLAIN))
 check('OPTIN_WANT lists dxva2, evr, xpsprint, sfc, sfc_os and tbs (Diablo II: Resurrected), twinapi.appcore (Hellblade II) (%s)' % names,
       {'dxva2', 'evr', 'xpsprint', 'sfc', 'sfc_os', 'tbs', 'twinapi.appcore'} <= set(names))
 check('none of them is in the list shipped under its own name', not any(re.search(r'\b%s\b' % n, want) for n in names if n not in PLAIN))

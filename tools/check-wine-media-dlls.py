@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require the Wine WMVCORE frontend and its reader dependency in the IPA farm.
+"""Require Wine's media readers and the 1C OLE dialog and ODBC dependencies in the IPA farm.
 
 Checks actual PE exports and import closure after the optional extra-DLL build.
 Does not claim codec support or change the existing 64-bit backend opt-in.
@@ -99,6 +99,8 @@ def check(bundle):
     required = {
         'wmvcore.dll': ('WMCreateReader', 'WMCreateSyncReader', 'WMCreateProfileManager'),
         'winegstreamer.dll': ('winegstreamer_create_wm_sync_reader',),
+        'oledlg.dll': ('OleUIInsertObjectW', 'OleUIEditLinksW', 'OleUIPasteSpecialW'),
+        'odbc32.dll': ('SQLAllocHandle', 'SQLDriverConnectW', 'SQLExecDirectW'),
     }
     for name, functions in required.items():
         if name not in shipped:
